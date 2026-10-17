@@ -1,0 +1,115 @@
+--- review0906/Test_NDCN.py
++++ Test_NDCN_exportfix.py
+@@ -219,7 +219,7 @@
+ 		# neither a pooled CI over all rounds nor a paired CI for a difference
+ 		# between two systems, so anything comparative has to be computed from
+ 		# these values instead.
+-		all_ep.extend(float(np.asarray(x).reshape(-1)[0]) for x in accuracies)
++		all_ep.extend(float(x.detach().cpu().reshape(-1)[0].item()) for x in accuracies)
+ 		acc, h = utils.mean_confidence_interval(accuracies)
+ 		# utils.accuracy() keeps a singleton dim, so scipy returns shape-(1,)
+ 		# arrays here. numpy < 2.0 unwrapped them silently; numpy >= 2.0 raises.
+--- review0906/Test_NDCN_paired_checked.py
++++ Test_NDCN_paired_exportfix.py
+@@ -103,8 +103,12 @@
+ 	topk = nrm.topk(k, dim=1).values
+ 	r_before = topk.sum(1) / (nrm.sum(1) + c.eps)                   # NQ
+ 
+-	ref_q = Zq.mean(dim=1)
+-	Mq, alpha_q, _ = c._mask(Zq, ref_q)
++	# forward() clears the support normalization range. Recomputing _mask
++	# here would silently use the query range under supminmax. Read the
++	# actual mask cached by the supplied 0906 models/ndcn.py instead.
++	if getattr(c, '_last_Mq', None) is None:
++		raise RuntimeError('No cached forward mask; use the supplied 0906 models/ndcn.py')
++	Mq, alpha_q = c._last_Mq, c._last_alpha_q
+ 	mask_mean = Mq.mean(dim=1)
+ 	# concentration of mask mass on the high-energy half
+ 	order = nrm.argsort(dim=1, descending=True)
+--- review0906/Train_NDCN_pretrained_checked.py
++++ Train_NDCN_maintenance0906.py
+@@ -178,6 +178,9 @@
+ parser.add_argument('--seed', type=int, default=0)
+ parser.add_argument('--deterministic', action='store_true',
+ 					help='use deterministic CUDA kernels where available')
++parser.add_argument('--freeze_bn_stats', action='store_true',
++					help='experimental ablation: hold backbone BN running statistics fixed; '
++						 'affine weights remain trainable. Default retains old behavior.')
+ opt = parser.parse_args()
+ cudnn.benchmark = not opt.deterministic
+ cudnn.deterministic = opt.deterministic
+@@ -220,6 +223,11 @@
+ 	aux_meters = {k: utils.AverageMeter() for k in ['triplet', 'bg', 'div', 'mask']}
+ 
+ 	model.train()
++	if opt.freeze_bn_stats:
++		base = model.module if hasattr(model, 'module') else model
++		for module in base.features.modules():
++			if isinstance(module, nn.modules.batchnorm._BatchNorm):
++				module.eval()
+ 	end = time.time()
+ 	for episode_index, (query_images, query_targets, support_images, support_targets) in enumerate(train_loader):
+ 		data_time.update(time.time() - end)
+@@ -407,7 +415,7 @@
+ 
+ 	resume_checkpoint = None
+ 	if opt.resume:
+-		checkpoint = utils.get_resume_file(opt.resume, F_txt)
++		checkpoint = torch.load(opt.resume, map_location='cpu', weights_only=False)
+ 		resume_checkpoint = checkpoint
+ 		opt.start_epoch = int(checkpoint['epoch_index']) + 1
+ 		best_prec1 = checkpoint['best_prec1']
+@@ -433,7 +441,8 @@
+ 	print('===================================== Training =====================================', file=F_txt)
+ 
+ 	Train_losses, Val_losses, Test_losses = [], [], []
+-	best_epoch, test_at_best = -1, 0.0
++	best_epoch = int(resume_checkpoint.get('best_epoch', -1)) if resume_checkpoint else -1
++	test_at_best = float(resume_checkpoint.get('test_at_best', float('nan'))) if resume_checkpoint else float('nan')
+ 	for epoch_item in range(opt.start_epoch, opt.epochs):
+ 		print('==================== Epoch %d ====================' % epoch_item)
+ 		print('==================== Epoch %d ====================' % epoch_item, file=F_txt)
+@@ -478,20 +487,25 @@
+ 			if os.path.isfile(ck):
+ 				sd = torch.load(ck, map_location='cpu', weights_only=False)
+ 				model.load_state_dict(sd['model'])
++				# Keep the current schedule position while restoring optimizer
++				# moments. Otherwise reloading an older LR desynchronizes cosine.
++				current_lrs = [g['lr'] for g in optimizer.param_groups]
+ 				optimizer.load_state_dict(sd['optimizer'])
++				for group, lr in zip(optimizer.param_groups, current_lrs):
++					group['lr'] = lr
+ 				model.to(device)
+ 
+ 		is_best = prec1_val > best_prec1
+ 		if is_best:
+ 			best_epoch, test_at_best = epoch_item, prec1_test
+-			best_prec1 = max(prec1_val, best_prec1)
+-			if opt.monitor_test:
+-				sel = ('  [selection]     best_val = {:.2f} at epoch {}   '
+-					   'test at that epoch = {:.2f}'.format(
+-						   float(best_prec1), best_epoch, float(test_at_best)))
+-			else:
+-				sel = ('  [selection]     best_val = {:.2f} at epoch {}; test split '
+-					   'not evaluated'.format(float(best_prec1), best_epoch))
++		best_prec1 = max(prec1_val, best_prec1)
++		if opt.monitor_test:
++			sel = ('  [selection]     best_val = {:.2f} at epoch {}   '
++				   'test at that epoch = {:.2f}'.format(
++					   float(best_prec1), best_epoch, float(test_at_best)))
++		else:
++			sel = ('  [selection]     best_val = {:.2f} at epoch {}; test split '
++				   'not evaluated'.format(float(best_prec1), best_epoch))
+ 		print(sel); print(sel, file=F_txt)
+ 
+ 		# Python buffers text writes in 8 KB chunks, so without this the log
+@@ -513,6 +527,9 @@
+ 				 'ndcn_cfg': build_ndcn_cfg(opt) if opt.classifier_model in ('NDCN', 'NDCN_Local') else None,
+ 				 'model': model.state_dict(),
+ 				 'best_prec1': best_prec1,
++				 'best_epoch': best_epoch,
++				 'test_at_best': test_at_best,
++				 'freeze_bn_stats': opt.freeze_bn_stats,
+ 				 'optimizer': optimizer.state_dict(),
+ 				 'scheduler': scheduler.state_dict() if scheduler is not None else None,
+ 				 'initialization': ('pretrained:' + opt.pretrained if opt.pretrained else
